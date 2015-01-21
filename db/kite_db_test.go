@@ -24,6 +24,7 @@ func TestSave(t *testing.T) {
 	end := time.Now().UnixNano()
 	log.Println("wait for async write")
 	time.Sleep(time.Second * 5)
+
 	for i := 0; i < N; i++ {
 		entity := session.Query(fmt.Sprintf("%d", i))
 		log.Println("query result", string(entity.Body))

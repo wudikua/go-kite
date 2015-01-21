@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,7 +16,7 @@ import (
 const PAGEFILE_SUFFIX = ".data"
 const PAGE_FILE_HEADER_SIZE = 4 * 1024
 const NEW_FREE_LIST_SIZE = 32
-const PAGE_FILE_PAGE_COUNT = 32
+const PAGE_FILE_PAGE_COUNT = 1024
 const PAGE_FILE_PAGE_SIZE = 4 * 1024
 const MAX_PAGE_FILES = 32
 
@@ -23,6 +24,7 @@ const MAX_PAGE_FILES = 32
 type KiteDBPageFile struct {
 	path           string
 	writeFile      map[int]*os.File
+	readFile       map[int]*os.File
 	pageSize       int                 //每页的大小 默认4K
 	pageCount      int                 //每个PageFile文件包含page数量
 	pageCache      map[int]*KiteDBPage //以页ID为索引的缓存
@@ -30,9 +32,10 @@ type KiteDBPageFile struct {
 	writes         chan *KiteDBWrite   //刷盘队列
 	writeStop      chan int
 	writeFlush     chan int
-	allocLock      sync.Mutex     //主要是对分配Page的时候需要加锁，防止重复分配了一个Page
-	freeList       *KiteRingQueue //空闲页 优先向这里写入
-	nextFreePageId int            //空闲页的分配从这里开始
+	pageStatus     *KiteBitset
+	allocLock      sync.Mutex //主要是对分配Page的时候需要加锁，防止重复分配了一个Page
+	freeList       *list.List //空闲页 优先向这里写入
+	nextFreePageId int        //空闲页的分配从这里开始
 }
 
 // 数据的写入做了个封装
@@ -55,48 +58,54 @@ func NewKiteDBPageFile(base string, dbName string) *KiteDBPageFile {
 	var mutex sync.Mutex
 	ins := &KiteDBPageFile{
 		path:          dir,
+		readFile:      make(map[int]*os.File),
+		writeFile:     make(map[int]*os.File),
 		pageSize:      PAGE_FILE_PAGE_SIZE,
 		pageCount:     PAGE_FILE_PAGE_COUNT,
 		pageCache:     make(map[int]*KiteDBPage),
 		pageCacheSize: 1024, //4MB
-		writes:        make(chan *KiteDBWrite),
-		freeList:      NewKiteRingQueue(NEW_FREE_LIST_SIZE * 2),
+		writes:        make(chan *KiteDBWrite, 1),
+		pageStatus:    NewKiteBitset(),
+		freeList:      list.New(),
 		allocLock:     mutex,
 		writeStop:     make(chan int, 1),
 		writeFlush:    make(chan int, 1),
 	}
-	last := 0
-	// 判断是否是已经有数据
-	if _, err := os.Stat(fmt.Sprintf("%s/%d%s", dir, last, PAGEFILE_SUFFIX)); err != nil {
-		ins.writeFile = make(map[int]*os.File)
-		f, err := os.OpenFile(fmt.Sprintf("%s/%d%s", dir, last, PAGEFILE_SUFFIX), os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
-			log.Fatal(err)
-		}
-		ins.writeFile[last] = f
-	} else {
-		log.Fatal("load data", err)
-	}
-	// log.Println("write file create as ", ins.writeFile)
-	fileInfo, err := ins.writeFile[last].Stat()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if fileInfo.Size() == 0 {
-		ins.nextFreePageId = 1
-	} else {
-		ins.nextFreePageId = int(fileInfo.Size()-PAGE_FILE_HEADER_SIZE)/ins.pageSize + 1
-	}
+	// last := 0
+	// // 判断是否是已经有数据
+	// if _, err := os.Stat(fmt.Sprintf("%s/%d%s", dir, last, PAGEFILE_SUFFIX)); err != nil {
+	// 	ins.writeFile = make(map[int]*os.File)
+	// 	f, err := os.OpenFile(fmt.Sprintf("%s/%d%s", dir, last, PAGEFILE_SUFFIX), os.O_CREATE|os.O_RDWR, 0666)
+	// 	if err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// 	ins.writeFile[last] = f
+	// } else {
+	// 	log.Fatal("load data", err)
+	// }
+	// // log.Println("write file create as ", ins.writeFile)
+	// fileInfo, err := ins.writeFile[last].Stat()
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// if fileInfo.Size() == 0 {
+	// 	ins.nextFreePageId = 1
+	// } else {
+	// 	ins.nextFreePageId = int(fileInfo.Size()-PAGE_FILE_HEADER_SIZE)/ins.pageSize + 1
+	// }
+	ins.nextFreePageId = ins.pageStatus.Len()
 	go ins.pollWrite()
 	return ins
 }
 
 func (self *KiteDBPageFile) reAllocFreeList(size int) {
 	for i := 0; i < size; i++ {
-		self.freeList.Enqueue(&KiteDBPage{
+		self.freeList.PushFront(&KiteDBPage{
 			pageId: self.nextFreePageId + i,
 		})
 	}
+	bs := make([]byte, NEW_FREE_LIST_SIZE/8)
+	self.pageStatus.AppendBytes(bs)
 	self.nextFreePageId += size
 }
 
@@ -111,8 +120,11 @@ func (self *KiteDBPageFile) Allocate(count int) []*KiteDBPage {
 			// 重新分配新的freeList
 			self.reAllocFreeList(NEW_FREE_LIST_SIZE)
 		}
-
-		pages[i], _ = self.freeList.Dequeue()
+		e := self.freeList.Back()
+		pages[i] = e.Value.(*KiteDBPage)
+		self.freeList.Remove(e)
+		// 代表页已经被占用
+		self.pageStatus.Set(pages[i].pageId, true)
 	}
 	// log.Println("create pages result", pages)
 	return pages
@@ -128,14 +140,14 @@ func (self *KiteDBPageFile) Read(pageIds []int) (pages []*KiteDBPage) {
 				pageId: pageId,
 			}
 			no := page.getWriteFileNo()
-			file := self.writeFile[no]
+			file := self.readFile[no]
 			// log.Println("write file no", no, file)
 			if file == nil {
 				file, _ = os.OpenFile(
 					fmt.Sprintf("%s/%d%s", self.path, no, PAGEFILE_SUFFIX),
 					os.O_CREATE|os.O_RDWR,
 					0666)
-				self.writeFile[no] = file
+				self.readFile[no] = file
 			}
 			file.Seek(page.getOffset(), 0)
 			page.ToPage(file)

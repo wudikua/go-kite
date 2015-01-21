@@ -5,23 +5,25 @@ import (
 	"errors"
 	"go-kite/store"
 	// "log"
+	// "fmt"
 	"math"
 )
 
 // 一个存储引擎
 type KiteDB struct {
 	dbs map[string]*KiteDBPageFile
-	idx *KiteBtreeIndex
+	idx *KiteRedisIndex
 	dir string
 }
 
 // 创建一个DB，指定一个存储目录
 func NewKiteDB(dir string) *KiteDB {
-	return &KiteDB{
+	ins := &KiteDB{
 		dir: dir,
 		dbs: make(map[string]*KiteDBPageFile),
-		idx: NewIndex(),
+		idx: NewRedisIndex(),
 	}
+	return ins
 }
 
 func (self *KiteDB) SelectDB(dbName string) (*KiteDBPageFile, error) {

@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"github.com/datastream/btree"
-	// "log"
+	"github.com/xuyu/goredis"
+	"log"
 )
 
 type KiteIndexItem struct {
@@ -33,11 +34,45 @@ func (self *KiteIndexItem) Unmarshal(b []byte) error {
 	return nil
 }
 
+type KiteIndex interface {
+	Insert(messageId string, data *KiteIndexItem) error
+	Search(messageId string) (*KiteIndexItem, error)
+}
+
+type KiteRedisIndex struct {
+	redis *goredis.Redis
+}
+
+func NewRedisIndex() *KiteRedisIndex {
+	redis, err := goredis.Dial(&goredis.DialConfig{Address: ":6379"})
+	if err != nil {
+		log.Fatal("make sure indexing redis is alive")
+	}
+	ins := &KiteRedisIndex{
+		redis: redis,
+	}
+	return ins
+}
+
+func (self *KiteRedisIndex) Insert(messageId string, data *KiteIndexItem) error {
+	self.redis.ExecuteCommand("SET", messageId, data.Marshal())
+	return nil
+}
+
+func (self *KiteRedisIndex) Search(messageId string) (*KiteIndexItem, error) {
+	r, _ := self.redis.ExecuteCommand("GET", messageId)
+	b, _ := r.BytesValue()
+	ins := &KiteIndexItem{}
+	ins.Unmarshal(b)
+	log.Print("index unmarshal ", ins.topic)
+	return ins, nil
+}
+
 type KiteBtreeIndex struct {
 	tree *btree.Btree
 }
 
-func NewIndex() *KiteBtreeIndex {
+func NewBtreeIndex() *KiteBtreeIndex {
 	ins := &KiteBtreeIndex{
 		tree: btree.NewBtree(),
 	}
